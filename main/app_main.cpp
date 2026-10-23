@@ -1,0 +1,303 @@
+// TO UPLOAD TO ESP32 RUN BELOW COMMANDS IN IDF POWERSHELL:
+
+// 1. idf.py build
+// 2. idf.py -p COM4 flash monitor
+
+
+// TO SAVE TO GITHUB RUN COMMANDS IN TERMINAL:
+// git add .
+// git commit -m "working version"
+// git push
+
+// TO REVERT TO OTHER VERSION:
+// git log --oneline
+// git checkout (COMMIT ID)
+
+
+
+#include "who_camera.h"
+#include "driver/gpio.h"
+#include "beacon_tracker.h"
+#include "boot_button.h"
+#include "cellular_link.h"
+#include "cellular_diagnostics.h"
+#include "cellular_protocol.h"
+#include <cstdio>
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "mmwave_sensor.h"
+#include "setup_mode.h"
+#include "temp_humidity_sensor.h"
+#include "thermal_camera.h"
+#include "tuned_face_detection.h"
+#include "usb_camera_stream.h"
+#include "usb_telemetry.h"
+
+#define LED_GPIO        GPIO_NUM_2
+// The ESP32-S3 has a WS2812 RGB NeoPixel on GPIO 48.
+// We hold it LOW so floating/spurious signals don't light it up.
+#define NEOPIXEL_GPIO   GPIO_NUM_48
+
+static QueueHandle_t xQueueAIFrame = NULL;
+static QueueHandle_t xQueueUSBFrame = NULL;
+
+namespace {
+
+constexpr TickType_t THERMAL_FRAME_INTERVAL = pdMS_TO_TICKS(250); // 4 FPS
+
+TaskHandle_t s_thermal_task_handle = nullptr;
+
+void thermal_stream_task(void *)
+{
+    TickType_t next_frame_time = xTaskGetTickCount();
+    while (true) {
+        size_t csv_length = 0;
+        const char *csv = thermal_camera_read_csv(&csv_length);
+        if (csv) {
+            usb_telemetry_send_thermal_frame(csv, csv_length);
+            uint8_t x = 0;
+            uint8_t y = 0;
+            uint8_t width = 0;
+            uint8_t height = 0;
+            const bool detected = thermal_camera_get_heat_trace_bounds(
+                &x, &y, &width, &height);
+            usb_telemetry_send_heat_trace_bounds(detected, x, y, width, height);
+        }
+        xTaskDelayUntil(&next_frame_time, THERMAL_FRAME_INTERVAL);
+    }
+}
+
+void thermal_stream_start()
+{
+    // Capture the task handle (was previously discarded as nullptr) so it
+    // can be suspended/resumed later based on driver presence.
+    if (xTaskCreatePinnedToCore(thermal_stream_task, "thermal_stream", 6144,
+                                nullptr, 3, &s_thermal_task_handle, 0) != pdPASS) {
+        ESP_LOGW("app_main", "Could not start thermal USB stream task");
+    }
+}
+
+// ---- Background sensor pause/resume (NEW) ----
+// Pauses the thermal, face-detection, and USB-camera-stream tasks while the
+// driver is near, and resumes them once away. Thermal's handle is captured
+// directly above since this file creates that task. Face detection and the
+// USB stream tasks are created inside tuned_face_detection.cpp and
+// usb_camera_stream.cpp (not edited here); their handles are looked up by
+// the task names those files already pass to xTaskCreatePinnedToCore
+// ("tuned_face_detection" and "usb_camera"). This requires FreeRTOS task
+// handle lookup by name to be enabled in sdkconfig (`idf.py menuconfig` ->
+// Component config -> FreeRTOS -> enable "Use trace facility" / the option
+// that backs configUSE_TRACE_FACILITY / INCLUDE_xTaskGetHandle). If it is
+// not enabled, the lookup below returns null and this code logs a warning
+// once and simply leaves those two tasks running rather than failing.
+//
+// NOT covered: the camera sensor's own capture loop (who_camera.* -- not
+// available yet). Frames may keep arriving into the shared queues while
+// these consumers are suspended; with a queue depth of 2 that just means
+// the camera side may block/drop older frames rather than crash, but it
+// is not a real stop of the camera hardware itself.
+TaskHandle_t s_face_task_handle = nullptr;
+TaskHandle_t s_usb_stream_task_handle = nullptr;
+bool s_background_handles_resolved = false;
+
+void resolve_background_task_handles()
+{
+    if (s_background_handles_resolved) return;
+    s_face_task_handle = xTaskGetHandle("tuned_face_detection");
+    s_usb_stream_task_handle = xTaskGetHandle("usb_camera");
+    if (!s_face_task_handle) {
+        ESP_LOGW("app_main", "Could not look up face-detection task by name; "
+                 "it will keep running regardless of driver presence. Check "
+                 "FreeRTOS task-handle-by-name support in menuconfig.");
+    }
+    if (!s_usb_stream_task_handle) {
+        ESP_LOGW("app_main", "Could not look up usb-camera-stream task by name; "
+                 "it will keep running regardless of driver presence.");
+    }
+    s_background_handles_resolved = true;
+}
+
+void set_background_sensors_running(bool should_run)
+{
+    resolve_background_task_handles();
+
+    if (s_thermal_task_handle) {
+        if (should_run) vTaskResume(s_thermal_task_handle);
+        else vTaskSuspend(s_thermal_task_handle);
+    }
+    if (s_face_task_handle) {
+        if (should_run) vTaskResume(s_face_task_handle);
+        else vTaskSuspend(s_face_task_handle);
+    }
+    if (s_usb_stream_task_handle) {
+        if (should_run) vTaskResume(s_usb_stream_task_handle);
+        else vTaskSuspend(s_usb_stream_task_handle);
+    }
+}
+
+} // namespace
+
+extern "C" void app_main()
+{
+    setup_mode_init();  // handles NVS, button GPIO
+    boot_button_init();
+    const esp_err_t cellular_status = cellular_link_init();
+    if (cellular_status != ESP_OK) {
+        ESP_LOGW("app_main", "Cellular link unavailable: %s", esp_err_to_name(cellular_status));
+        cellular_diagnostics_record("LINK_UNAVAILABLE");
+    }
+
+    // Suppress the onboard NeoPixel (GPIO 48) by driving it low.
+    // Without this the camera driver leaves the data line floating,
+    // which can latch a bright white colour into the LED.
+    gpio_reset_pin(NEOPIXEL_GPIO);
+    gpio_set_direction(NEOPIXEL_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(NEOPIXEL_GPIO, 0);
+
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0);
+
+    // mmwave + temp/humidity init moved below: they are only started once
+    // the beacon first reports the driver as away (see the loop below).
+    const bool thermal_camera_ready = thermal_camera_init();
+    usb_telemetry_init();
+
+    // ---- Beacon-based driver presence (NEW) ----
+    // Scans for the driver's BLE beacon directly on this board (no second
+    // board or wire needed). beacon_tracker_driver_near() reports whether
+    // the beacon is within its configured radius.
+    beacon_tracker_init();
+
+    xQueueAIFrame = xQueueCreate(2, sizeof(camera_fb_t *));
+    xQueueUSBFrame = xQueueCreate(2, sizeof(camera_fb_t *));
+    register_camera(PIXFORMAT_RGB565, FRAMESIZE_QVGA, 1, xQueueAIFrame);
+    register_tuned_face_detection(xQueueAIFrame, xQueueUSBFrame, false);
+    usb_camera_stream_start(xQueueUSBFrame);
+    if (thermal_camera_ready) {
+        thermal_stream_start();
+    }
+
+    float temperature_f = 0.0f;
+    float humidity_percent = 0.0f;
+    bool temperature_humidity_valid = false;
+    bool face_detected_since_telemetry = false;
+    TickType_t last_sensor_read = 0;
+    TickType_t last_stack_report = xTaskGetTickCount();
+    bool presence_sensors_started = false;  // mmwave + temp/humidity
+    bool background_state_initialized = false;
+    bool previous_driver_near = true;
+
+    while (true)
+    {
+        if (boot_button_released()) {
+            char phone[32];
+            if (setup_mode_get_phone_number(phone, sizeof(phone))) {
+                char name[64];
+                char message[cellular::MAX_MESSAGE + 1];
+                if (!setup_mode_get_name(name, sizeof(name))) {
+                    ESP_LOGW("app_main", "Save a valid name in setup before sending the BOOT test");
+                    cellular_diagnostics_record("NO_NAME");
+                } else {
+                    const int length = snprintf(message, sizeof(message),
+                        "Backseat Minder test for %s. This checks delivery of passenger alerts. No action is needed.",
+                        name);
+                    if (length < 0 || static_cast<size_t>(length) >= sizeof(message) ||
+                        !cellular::valid_message(message)) {
+                        ESP_LOGW("app_main", "Saved name cannot be used in the BOOT test; update it in setup");
+                        cellular_diagnostics_record("INVALID_NAME");
+                    } else {
+                        cellular_link_send_sms(phone, message);
+                    }
+                }
+            } else {
+                ESP_LOGW("app_main", "No valid phone number configured; save a number in setup mode before sending SMS");
+                cellular_diagnostics_record("NO_PHONE");
+            }
+        }
+
+        if (setup_mode_button_pressed())
+            enter_setup_mode();  // blocks until confirmed
+
+        // ---- Driver-presence gate (NEW) ----
+        // true = beacon board says the driver is within the radius (near).
+        const bool driver_near = beacon_tracker_driver_near();
+
+        // Pause/resume thermal + face-detection + USB-camera-stream only on
+        // a state change, not every loop (suspending an already-suspended
+        // task is harmless, but there's no reason to call it 50x/second).
+        if (!background_state_initialized || driver_near != previous_driver_near) {
+            set_background_sensors_running(!driver_near);  // run while away
+            previous_driver_near = driver_near;
+            background_state_initialized = true;
+        }
+
+        if (!driver_near) {
+            // Driver is away. On the FIRST loop where this is true, actually
+            // start the mmwave + temp/humidity drivers (not just use their
+            // results) -- they are never initialized at all while the driver
+            // is near.
+            if (!presence_sensors_started) {
+                temp_humidity_sensor_init();
+                mmwave_sensor_init();
+                presence_sensors_started = true;
+                last_sensor_read = xTaskGetTickCount();  // respect the DHT22's settling time
+                ESP_LOGI("app_main", "Driver away: starting mmwave + temp/humidity sensors");
+            }
+
+            // ESP-WHO exposes face detection as a one-shot flag. Preserve any
+            // detection until the next telemetry sample instead of losing it
+            // between the main loop's polls and telemetry's 3 second polls.
+            face_detected_since_telemetry |= get_tuned_face_detected();
+            const bool mmwave_presence_detected = mmwave_sensor_presence_detected();
+            const bool thermal_heat_detected = thermal_camera_heat_trace_detected();
+            const bool human_presence_detected = face_detected_since_telemetry ||
+                                                 mmwave_presence_detected ||
+                                                 thermal_heat_detected;
+            gpio_set_level(LED_GPIO, human_presence_detected ? 1 : 0);
+
+            // AM2302/DHT22 measurements should be spaced by at least two seconds.
+            if (xTaskGetTickCount() - last_sensor_read >= pdMS_TO_TICKS(3000)) {
+                last_sensor_read = xTaskGetTickCount();
+                temperature_humidity_valid =
+                    temp_humidity_sensor_read(&temperature_f, &humidity_percent);
+                if (temperature_humidity_valid) {
+                    ESP_LOGI("app_main", "Temperature: %.1f F, Humidity: %.1f %%",
+                             temperature_f, humidity_percent);
+                }
+
+                usb_telemetry_send(temperature_f, humidity_percent,
+                                   temperature_humidity_valid,
+                                   face_detected_since_telemetry,
+                                   mmwave_presence_detected,
+                                   thermal_heat_detected,
+                                   human_presence_detected);
+
+                face_detected_since_telemetry = false;
+            }
+        } else {
+            // Driver is near: keep the presence LED off.
+            // If mmwave/temp-humidity haven't been started yet this boot,
+            // leave them untouched entirely (not just unused -- genuinely
+            // never initialized). If they were already started on an
+            // earlier "away" period, there's no deinit function exposed in
+            // their headers, so they stay running; mmwave is still polled
+            // here only to keep draining its UART buffer, not acted on.
+            if (presence_sensors_started) {
+                mmwave_sensor_presence_detected();
+            }
+            gpio_set_level(LED_GPIO, 0);
+            face_detected_since_telemetry = false;
+        }
+
+        if (xTaskGetTickCount() - last_stack_report >= pdMS_TO_TICKS(60000)) {
+            // ESP-IDF reports the minimum unused task stack in bytes.
+            ESP_LOGI("app_main", "Main task minimum free stack: %u bytes",
+                     static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+            last_stack_report = xTaskGetTickCount();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20)); // Keep the BOOT button responsive.
+    }
+}

@@ -1,0 +1,21 @@
+# ESP-IDF build
+build/
+sdkconfig.old
+sdkconfig.ci*
+
+# IDF component manager
+managed_components/
+
+# logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# PlatformIO and local verification environments
+cell/.pio/
+.pio-core/
+.venv-cell/
+tests/.build/
+__pycache__/
