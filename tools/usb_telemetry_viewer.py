@@ -112,6 +112,17 @@ def detection_statuses(sample: dict) -> dict:
     }
 
 
+def driver_status_text(sample: dict) -> str:
+    """Describe the beacon gate; older firmware sends no driver fields."""
+    if "driver_near" not in sample:
+        return "Driver: unknown (older firmware)"
+    rssi = sample.get("beacon_rssi", 0)
+    beacon = f"beacon {rssi} dBm" if rssi else "beacon not seen"
+    driver = "near" if sample["driver_near"] else "away"
+    sensors = "on" if sample.get("sensors_active") else "off"
+    return f"Driver: {driver} ({beacon}) - sensors {sensors}"
+
+
 def update_detection_labels(labels: dict, sample: dict) -> None:
     for name, detected in detection_statuses(sample).items():
         labels[name].configure(
@@ -341,7 +352,8 @@ def show_viewer(device: serial.Serial) -> int:
                         raise ValueError("expected a telemetry object")
                     update_trend(sample)
                     telemetry_label.configure(
-                        text=(f"Temperature: {sample.get('temperature_f', 0):.1f} °F\n"
+                        text=(f"{driver_status_text(sample)}\n"
+                              f"Temperature: {sample.get('temperature_f', 0):.1f} °F\n"
                               f"Humidity: {sample.get('humidity_percent', 0):.1f} %\n"
                               f"Temperature/humidity valid: {sample.get('temperature_humidity_valid')}")
                     )

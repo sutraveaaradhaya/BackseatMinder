@@ -52,7 +52,6 @@ uint8_t s_heat_trace_width = 0;
 uint8_t s_heat_trace_height = 0;
 i2c_master_bus_handle_t s_i2c_bus = nullptr;
 i2c_master_dev_handle_t s_i2c_device = nullptr;
-TaskHandle_t s_initialization_caller = nullptr;
 
 } // namespace
 
@@ -271,29 +270,37 @@ bool initialize_sensor()
     return true;
 }
 
-void initialization_task(void *)
-{
-    initialize_sensor();
-    xTaskNotifyGive(s_initialization_caller);
-    vTaskDelete(nullptr);
-}
-
 } // namespace
 
 bool thermal_camera_init()
 {
-    // Melexis parameter extraction temporarily allocates a 768-float work
-    // array. Run it on a short-lived task rather than overflowing ESP-IDF's
-    // 3584-byte main task stack.
-    s_initialization_caller = xTaskGetCurrentTaskHandle();
-    if (xTaskCreate(initialization_task, "mlx90640_init", 8192, nullptr, 5,
-                    nullptr) != pdPASS) {
-        ESP_LOGW(TAG, "Could not create MLX90640 initialization task");
+    if (s_ready) {
+        return true;
+    }
+    s_heat_trace_detected.store(false, std::memory_order_relaxed);
+    s_heat_trace_bounds_valid = false;
+    s_detection_frames = 0;
+    s_clear_frames = 0;
+    if (!initialize_sensor()) {
+        thermal_camera_deinit();
         return false;
     }
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    s_initialization_caller = nullptr;
-    return s_ready;
+    return true;
+}
+
+void thermal_camera_deinit()
+{
+    s_ready = false;
+    if (s_i2c_device) {
+        i2c_master_bus_rm_device(s_i2c_device);
+        s_i2c_device = nullptr;
+    }
+    if (s_i2c_bus) {
+        i2c_del_master_bus(s_i2c_bus);
+        s_i2c_bus = nullptr;
+    }
+    s_heat_trace_detected.store(false, std::memory_order_relaxed);
+    s_heat_trace_bounds_valid = false;
 }
 
 const char *thermal_camera_read_csv(size_t *csv_length)

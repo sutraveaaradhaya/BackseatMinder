@@ -1,8 +1,8 @@
 #pragma once
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "esp_camera.h"
 
-// Starts a task that converts face-detection output frames to JPEG and sends
-// at most one development preview frame per second over native USB.
-void usb_camera_stream_start(QueueHandle_t frame_queue);
+// Converts a camera frame to JPEG and sends it over native USB, at most a few
+// development preview frames per second. Frames in between are skipped. The
+// caller keeps ownership of the frame.
+void usb_camera_stream_send(const camera_fb_t *frame);

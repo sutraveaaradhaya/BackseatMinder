@@ -1,6 +1,8 @@
 #include "setup_mode.h"
 #include "cellular_protocol.h"
 #include "alert_message.h"
+#include "captive_dns.h"
+#include "phone_number.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,7 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
-#include "esp_system.h"
+#include "esp_attr.h"
 #include "esp_system.h"
 
 // External normally-open button between GPIO 38 and GND (internal pull-up).
@@ -52,6 +54,12 @@ static TaskHandle_t dns_task_handle = NULL;
 static esp_netif_t *s_ap_netif = NULL;
 static bool s_netif_inited = false;
 static bool s_eventloop_inited = false;
+
+// Survives esp_restart() (but not power loss): set when setup is requested
+// while the sensors are running, so the next boot opens setup before
+// starting Bluetooth, the camera or any other sensor.
+#define SETUP_REQUEST_MAGIC 0x5E7095E7u
+static RTC_NOINIT_ATTR uint32_t s_setup_request;
 
 // ─── NVS Helpers ───────────────────────────────────────────────────────
 
@@ -213,9 +221,6 @@ static bool build_portal_html(char *buf, size_t buf_size, const bsm_config_t *cf
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<meta charset='UTF-8'>"
         "<title>Backseat Minder Setup</title>"
-        "<link rel='preconnect' href='https://fonts.googleapis.com'>"
-        "<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>"
-        "<link href='https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700&display=swap' rel='stylesheet'>"
         "<style>"
         ":root{"
           "--bg:#0a0a0a;--surface:#141414;--border:#2a2a2a;--border-focus:#4ecca3;"
@@ -225,7 +230,7 @@ static bool build_portal_html(char *buf, size_t buf_size, const bsm_config_t *cf
         "*{box-sizing:border-box;margin:0;padding:0;}"
         "body{"
           "background:var(--bg);color:var(--text);"
-          "font-family:'DM Sans',sans-serif;"
+          "font-family:'DM Sans',system-ui,sans-serif;"
           "min-height:100vh;display:flex;flex-direction:column;"
           "align-items:center;justify-content:flex-start;"
           "padding:32px 20px 48px;"
@@ -304,7 +309,7 @@ static bool build_portal_html(char *buf, size_t buf_size, const bsm_config_t *cf
           "</div>"
           "<div class='field'>"
             "<label for='phone'>Mobile number <span style='color:#ff6b6b'>*</span></label>"
-            "<input type='tel' id='phone' name='phone' placeholder='+1 555 000 0000' value='%s'>"
+            "<input type='tel' id='phone' name='phone' required placeholder='+1 555 000 0000' value='%s'>"
           "</div>"
 
           "<hr class='divider'>"
@@ -355,11 +360,10 @@ static const char *CONFIRM_HTML =
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<meta charset='UTF-8'>"
     "<title>All Set</title>"
-    "<link href='https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;700&display=swap' rel='stylesheet'>"
     "<style>"
     "body{margin:0;min-height:100vh;display:flex;flex-direction:column;"
     "align-items:center;justify-content:center;"
-    "background:#0a0a0a;color:#f0f0f0;font-family:'DM Sans',sans-serif;"
+    "background:#0a0a0a;color:#f0f0f0;font-family:'DM Sans',system-ui,sans-serif;"
     "text-align:center;padding:24px;box-sizing:border-box;}"
     ".icon{font-size:3rem;margin-bottom:16px;color:#4ecca3;}"
     "h1{font-size:1.5rem;margin-bottom:8px;color:#4ecca3;}"
@@ -367,22 +371,34 @@ static const char *CONFIRM_HTML =
     "</style></head><body>"
     "<div class='icon'>&#10003;</div>"
     "<h1>All Set!</h1>"
-    "<p>Backseat Minder is now active.<br>Your settings have been saved.<br>You can close this page.</p>"
+    "<p>Your settings have been saved.<br>Backseat Minder is restarting and the<br>setup Wi-Fi will turn off. You can close this page.</p>"
     "</body></html>";
 
 // ─── DNS HIJACK TASK ────────────────────────────────────────────────
 
+// Answers every A query with the setup IP so any hostname opens the portal.
 static void dns_server_task(void *pvParameters)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "DNS socket failed");
+        vTaskDelete(NULL);
+        return;
+    }
 
     struct sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(53);
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "DNS bind failed");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
 
+    static const uint8_t setup_ip[4] = {192, 168, 4, 1};
     uint8_t buffer[512];
 
     while (true)
@@ -392,25 +408,14 @@ static void dns_server_task(void *pvParameters)
 
         int recv_len = recvfrom(sock, buffer, sizeof(buffer), 0,
                                 (struct sockaddr *)&client_addr, &len);
+        if (recv_len <= 0) continue;
 
-        if (recv_len < 12) continue;
-
-        buffer[2] |= 0x80;
-        buffer[7] = buffer[5];
-
-        int idx = recv_len;
-
-        buffer[idx++] = 0xC0; buffer[idx++] = 0x0C;
-        buffer[idx++] = 0x00; buffer[idx++] = 0x01;
-        buffer[idx++] = 0x00; buffer[idx++] = 0x01;
-        buffer[idx++] = 0x00; buffer[idx++] = 0x00;
-        buffer[idx++] = 0x00; buffer[idx++] = 0x3C;
-        buffer[idx++] = 0x00; buffer[idx++] = 0x04;
-        buffer[idx++] = 192;  buffer[idx++] = 168;
-        buffer[idx++] = 4;    buffer[idx++] = 1;
-
-        sendto(sock, buffer, idx, 0,
-               (struct sockaddr *)&client_addr, len);
+        const size_t response_len = captive_dns_response(
+            buffer, (size_t)recv_len, sizeof(buffer), setup_ip);
+        if (response_len) {
+            sendto(sock, buffer, response_len, 0,
+                   (struct sockaddr *)&client_addr, len);
+        }
     }
 }
 
@@ -483,6 +488,21 @@ static esp_err_t confirm_post_handler(httpd_req_t *req)
     cfg.emerg_alerts = (strcmp(ea_val, "1") == 0);
 
     free(body);
+
+    if (!normalize_phone(cfg.phone, cfg.phone, sizeof(cfg.phone)) ||
+        (cfg.ec1[0] && !normalize_phone(cfg.ec1, cfg.ec1, sizeof(cfg.ec1))) ||
+        (cfg.ec2[0] && !normalize_phone(cfg.ec2, cfg.ec2, sizeof(cfg.ec2))) ||
+        (cfg.ec3[0] && !normalize_phone(cfg.ec3, cfg.ec3, sizeof(cfg.ec3)))) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req,
+            "<!DOCTYPE html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<h1>Please check the phone numbers</h1>"
+            "<p>The mobile number is required. Each number needs 7 to 15 digits, "
+            "optionally starting with + and the country code (for example +1 555 000 0000).</p>"
+            "<p><a href='/'>Return to setup</a></p>", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
 
     char alert[cellular::MAX_MESSAGE + 1];
     if (!build_alert_message(cfg.name, alert, sizeof(alert))) {
@@ -600,10 +620,23 @@ static void start_ap(void)
 
     esp_netif_dhcps_stop(ap_netif);
     esp_netif_set_ip_info(ap_netif, &ip_info);
+    // Tell clients to use our DNS server (which answers every name with
+    // 192.168.4.1) and, for newer phones, where the captive portal is.
+    esp_netif_dns_info_t dns_info = {};
+    dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+    dns_info.ip.u_addr.ip4.addr = ip_info.ip.addr;
+    uint8_t offer_dns = 1;
+    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                           &offer_dns, sizeof(offer_dns));
+    esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+    static char portal_uri[] = "http://" SETUP_IP "/";
+    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
+                           portal_uri, strlen(portal_uri));
     esp_netif_dhcps_start(ap_netif);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 
     wifi_config_t wifi_config = {};
@@ -611,6 +644,7 @@ static void start_ap(void)
     strncpy((char *)wifi_config.ap.password, WIFI_PASS, sizeof(wifi_config.ap.password));
 
     wifi_config.ap.ssid_len       = strlen(WIFI_SSID);
+    wifi_config.ap.channel        = 1;
     wifi_config.ap.max_connection = 4;
     wifi_config.ap.authmode       = WIFI_AUTH_OPEN;
 
@@ -619,7 +653,8 @@ static void start_ap(void)
 
     xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, &dns_task_handle);
 
-    ESP_LOGI(TAG, "AP + DNS started");
+    ESP_LOGI(TAG, "Setup Wi-Fi \"%s\" (open) started; portal at http://%s/",
+             WIFI_SSID, SETUP_IP);
 }
 
 // ─── PUBLIC API ────────────────────────────────────────────────
@@ -652,15 +687,46 @@ bool setup_mode_get_phone_number(char *buffer, size_t capacity)
     nvs_close(handle);
     if (result != ESP_OK) return false;
 
-    char normalized[MAX_PHONE_LEN] = {};
-    size_t used = 0;
-    for (const char *p = saved; *p; ++p) {
-        if (*p == ' ' || *p == '-' || *p == '(' || *p == ')' || *p == '.') continue;
-        normalized[used++] = *p;
+    return normalize_phone(saved, buffer, capacity);
+}
+
+bool setup_mode_config_complete()
+{
+    char name[MAX_NAME_LEN];
+    char phone[MAX_PHONE_LEN];
+    char alert[cellular::MAX_MESSAGE + 1];
+    return setup_mode_get_name(name, sizeof(name)) &&
+           build_alert_message(name, alert, sizeof(alert)) &&
+           setup_mode_get_phone_number(phone, sizeof(phone));
+}
+
+bool setup_mode_requested_at_boot()
+{
+    const bool requested = s_setup_request == SETUP_REQUEST_MAGIC;
+    s_setup_request = 0;
+    if (requested) {
+        ESP_LOGI(TAG, "Setup was requested before restart");
+        return true;
     }
-    if (!cellular::valid_number(normalized) || used + 1 > capacity) return false;
-    memcpy(buffer, normalized, used + 1);
-    return true;
+    if (setup_mode_button_pressed()) {
+        ESP_LOGI(TAG, "Setup button held at boot");
+        return true;
+    }
+    if (!setup_mode_config_complete()) {
+        ESP_LOGI(TAG, "No saved name/phone number yet");
+        return true;
+    }
+    return false;
+}
+
+void setup_mode_restart_into_setup()
+{
+    ESP_LOGI(TAG, "Setup requested; restarting with sensors and Bluetooth off");
+    s_setup_request = SETUP_REQUEST_MAGIC;
+    while (gpio_get_level(BUTTON_GPIO) == 0)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(200)); // flush logs before restart
+    esp_restart();
 }
 
 void setup_mode_init()
@@ -690,6 +756,9 @@ void enter_setup_mode()
     setup_confirmed = false;
     start_ap();
     server = start_webserver();
+    if (!server) {
+        ESP_LOGE(TAG, "HTTP server failed to start");
+    }
 
     bool led_state = false;
 
@@ -699,6 +768,9 @@ void enter_setup_mode()
         gpio_set_level(LED_GPIO, led_state);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+    gpio_set_level(LED_GPIO, 0);
+    // Let the browser finish loading the confirmation page.
+    vTaskDelay(pdMS_TO_TICKS(1500));
 
     if (dns_task_handle) {
         vTaskDelete(dns_task_handle);

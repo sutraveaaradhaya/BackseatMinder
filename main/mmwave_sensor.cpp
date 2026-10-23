@@ -19,6 +19,8 @@ const char *TAG = "mmwave_sensor";
 char s_line_buffer[LINE_BUFFER_SIZE] = {};
 size_t s_line_length = 0;
 bool s_mmwave_presence_detected = false;
+bool s_running = false;
+bool s_configured = false; // Full configuration is sent once per boot.
 
 void process_packet()
 {
@@ -97,8 +99,11 @@ void configure_sensor()
 
 } // namespace
 
-void mmwave_sensor_init()
+void mmwave_sensor_start()
 {
+    if (s_running) {
+        return;
+    }
     uart_config_t config = {};
     config.baud_rate = SENSOR_BAUD_RATE;
     config.data_bits = UART_DATA_8_BITS;
@@ -111,14 +116,38 @@ void mmwave_sensor_init()
     ESP_ERROR_CHECK(uart_param_config(SENSOR_UART, &config));
     ESP_ERROR_CHECK(uart_set_pin(SENSOR_UART, SENSOR_TX_GPIO, SENSOR_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    s_running = true;
+    s_line_length = 0;
+    s_mmwave_presence_detected = false;
 
-    // The sensor requires at least one second after power-up before commands.
-    vTaskDelay(pdMS_TO_TICKS(1200));
-    configure_sensor();
+    if (!s_configured) {
+        // The sensor requires at least one second after power-up before commands.
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        configure_sensor(); // Ends with sensorStart.
+        s_configured = true;
+    } else {
+        send_command("sensorStart");
+        ESP_LOGI(TAG, "C4001 presence sensor started");
+    }
+}
+
+void mmwave_sensor_stop()
+{
+    if (!s_running) {
+        return;
+    }
+    send_command("sensorStop");
+    uart_driver_delete(SENSOR_UART);
+    s_running = false;
+    s_mmwave_presence_detected = false;
+    ESP_LOGI(TAG, "C4001 presence sensor stopped");
 }
 
 bool mmwave_sensor_presence_detected()
 {
+    if (!s_running) {
+        return false;
+    }
     drain_uart();
     return s_mmwave_presence_detected;
 }

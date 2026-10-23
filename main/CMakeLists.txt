@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "cellular_diagnostics.cpp" "boot_button.cpp" "cellular_link.cpp" "tuned_face_detection.cpp" "thermal_camera.cpp" "mlx90640/MLX90640_API.c" "mmwave_sensor.cpp" "usb_camera_stream.cpp" "usb_telemetry.cpp" "app_main.cpp" "setup_mode.cpp" "temp_humidity_sensor.cpp" "beacon_tracker.cpp"
+    SRCS "cellular_diagnostics.cpp" "boot_button.cpp" "cellular_link.cpp" "tuned_face_detection.cpp" "thermal_camera.cpp" "mlx90640/MLX90640_API.c" "mmwave_sensor.cpp" "usb_camera_stream.cpp" "usb_telemetry.cpp" "app_main.cpp" "setup_mode.cpp" "temp_humidity_sensor.cpp" "beacon_tracker.cpp" "camera_sensor.cpp" "presence_sensors.cpp"
     INCLUDE_DIRS "." "../shared"
     PRIV_REQUIRES
         modules

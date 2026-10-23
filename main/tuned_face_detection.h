@@ -1,13 +1,11 @@
 #pragma once
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "esp_camera.h"
 
-// Starts a two-stage ESP-WHO face detector tuned to favor recall over the
-// stock example's false-positive rate.
-void register_tuned_face_detection(QueueHandle_t frame_i,
-                                   QueueHandle_t frame_o = nullptr,
-                                   bool camera_fb_return = false);
+// Runs a two-stage ESP-WHO face detector, tuned to favor recall over the
+// stock example's false-positive rate, on one RGB565 camera frame. Detected
+// faces are boxed on the frame. Call from one task only.
+bool tuned_face_detect(camera_fb_t *frame);
 
 // Returns whether a face was detected since the previous call.
 bool get_tuned_face_detected();

@@ -7,12 +7,13 @@
 // development telemetry. Failure to connect USB never affects device behavior.
 void usb_telemetry_init();
 
-// Sends a BSMT JSON sensor sample and a BSMC cellular summary/history snapshot.
+// Sends a BSMT JSON sensor sample (plus driver/beacon state) and a BSMC cellular summary/history snapshot.
 // Values remain processed locally; this is development-only observability.
 void usb_telemetry_send(float temperature_f, float humidity_percent,
                         bool temperature_humidity_valid, bool face_detected,
                         bool mmwave_presence_detected, bool thermal_heat_detected,
-                        bool human_presence_detected);
+                        bool human_presence_detected, bool driver_near,
+                        bool sensors_active, int beacon_rssi);
 
 // Sends one JPEG frame with a binary BSMF header. This is used only by the
 // development camera viewer connected to native USB.

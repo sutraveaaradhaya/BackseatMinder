@@ -10,7 +10,13 @@ constexpr size_t THERMAL_CAMERA_PIXELS =
 
 // Initializes the MLX90640 on I2C0 (SDA GPIO 21, SCL GPIO 47). A missing
 // sensor is reported but does not prevent the rest of the device from running.
+// Melexis parameter extraction uses about 4 KB of stack: call it from a task
+// with at least 8 KB.
 bool thermal_camera_init();
+
+// Stops using the MLX90640 and releases the I2C bus. Safe to call repeatedly.
+// Call from the same task that reads frames.
+void thermal_camera_deinit();
 
 // Acquires a complete two-subpage frame and formats all 768 Celsius readings
 // as one comma-separated row. The returned pointer remains valid until the

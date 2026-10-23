@@ -1,2 +1,48 @@
+# Settings this project needs. If sdkconfig is deleted (or after
+# `idf.py fullclean` + a new sdkconfig), ESP-IDF rebuilds it from this file.
+
+# Freenove ESP32-S3 WROOM: 8 MB flash, 8 MB octal PSRAM.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
 # Main performs sensor reads, NVS access, portal setup and formatted telemetry.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Native USB (Serial/JTAG) carries binary telemetry; keep logs on UART0 only.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Driver beacon scanning (beacon_tracker.cpp) uses the BLE 4.2 GAP scan API.
+# On the ESP32-S3 ESP-IDF enables BLE 5.0 instead by default, which removes
+# esp_ble_gap_set_scan_params/esp_ble_gap_start_scanning (link errors).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+# CONFIG_BT_BLE_50_FEATURES_SUPPORTED is not set
+
+# Camera pins (ESP-WHO "Custom" camera module) for the Freenove board.
+CONFIG_CAMERA_MODULE_CUSTOM=y
+CONFIG_CAMERA_PIN_PWDN=-1
+CONFIG_CAMERA_PIN_RESET=-1
+CONFIG_CAMERA_PIN_XCLK=15
+CONFIG_CAMERA_PIN_SIOD=4
+CONFIG_CAMERA_PIN_SIOC=5
+CONFIG_CAMERA_PIN_VSYNC=6
+CONFIG_CAMERA_PIN_HREF=7
+CONFIG_CAMERA_PIN_PCLK=13
+CONFIG_CAMERA_PIN_Y2=11
+CONFIG_CAMERA_PIN_Y3=9
+CONFIG_CAMERA_PIN_Y4=8
+CONFIG_CAMERA_PIN_Y5=10
+CONFIG_CAMERA_PIN_Y6=12
+CONFIG_CAMERA_PIN_Y7=18
+CONFIG_CAMERA_PIN_Y8=17
+CONFIG_CAMERA_PIN_Y9=16

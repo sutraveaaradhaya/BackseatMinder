@@ -26,6 +26,11 @@ def main():
         '-Imain', '-Ishared', 'tests/alert_message_test.cpp', '-o', str(alert_executable)],
         cwd=ROOT, env=env, check=True)
     subprocess.run([str(alert_executable)], cwd=ROOT, check=True)
+    portal_executable = output / f'setup_portal{".exe" if os.name == "nt" else ""}'
+    subprocess.run(compiler + ['-std=c++17', '-Wall', '-Wextra', '-Werror',
+        '-Imain', '-Ishared', 'tests/setup_portal_test.cpp', '-o', str(portal_executable)],
+        cwd=ROOT, env=env, check=True)
+    subprocess.run([str(portal_executable)], cwd=ROOT, check=True)
     # Use the checked-in camera configuration in the primary pin-conflict guard.
     config_dir = output / 'config'
     config_dir.mkdir(exist_ok=True)

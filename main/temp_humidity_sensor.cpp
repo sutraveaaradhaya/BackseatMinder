@@ -106,6 +106,7 @@ bool read_dht22(uint8_t data[5])
 
 void temp_humidity_sensor_init()
 {
+    if (rx_channel) return;
     receive_queue = xQueueCreate(1, sizeof(size_t));
     ESP_ERROR_CHECK(receive_queue ? ESP_OK : ESP_ERR_NO_MEM);
     rmt_rx_channel_config_t rx_config = {};
@@ -123,6 +124,20 @@ void temp_humidity_sensor_init()
     ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(rx_channel, &callbacks, nullptr));
     ESP_ERROR_CHECK(rmt_enable(rx_channel));
     ESP_LOGI(TAG, "AM2302/DHT22 RMT capture initialized on GPIO %d", SENSOR_GPIO);
+}
+
+void temp_humidity_sensor_deinit()
+{
+    if (rx_channel) {
+        rmt_disable(rx_channel);
+        rmt_del_channel(rx_channel);
+        rx_channel = nullptr;
+    }
+    if (receive_queue) {
+        vQueueDelete(receive_queue);
+        receive_queue = nullptr;
+    }
+    gpio_reset_pin(SENSOR_GPIO);
 }
 
 bool temp_humidity_sensor_read(float *temperature_f, float *humidity_percent)

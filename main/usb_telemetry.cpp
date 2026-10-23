@@ -78,7 +78,8 @@ bool usb_telemetry_host_connected()
 void usb_telemetry_send(float temperature_f, float humidity_percent,
                         bool temperature_humidity_valid, bool face_detected,
                         bool mmwave_presence_detected, bool thermal_heat_detected,
-                        bool human_presence_detected)
+                        bool human_presence_detected, bool driver_near,
+                        bool sensors_active, int beacon_rssi)
 {
     if (!usb_telemetry_host_connected() ||
         xSemaphoreTake(s_write_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
@@ -95,14 +96,18 @@ void usb_telemetry_send(float temperature_f, float humidity_percent,
         "\"heat_trace_detected\":%s,"
         "\"human_presence_detected\":%s,"
         "\"temperature_humidity_valid\":%s,\"temperature_f\":%.1f,"
-        "\"humidity_percent\":%.1f}\n",
+        "\"humidity_percent\":%.1f,\"driver_near\":%s,"
+        "\"sensors_active\":%s,\"beacon_rssi\":%d}\n",
         esp_timer_get_time() / 1000,
         face_detected ? "true" : "false",
         mmwave_presence_detected ? "true" : "false",
         thermal_heat_detected ? "true" : "false",
         human_presence_detected ? "true" : "false",
         temperature_humidity_valid ? "true" : "false",
-        temperature_f, humidity_percent);
+        temperature_f, humidity_percent,
+        driver_near ? "true" : "false",
+        sensors_active ? "true" : "false",
+        beacon_rssi);
 
     if (length > 0 && length < static_cast<int>(sizeof(message))) {
         send_packet("BSMT", reinterpret_cast<const uint8_t *>(message),

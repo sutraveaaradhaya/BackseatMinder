@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This repository contains ESP-IDF firmware for an **ESP32-S3 camera-based back-seat occupancy reminder prototype**. The indicator LED reflects the combined face, mmWave and thermal presence signals.
+This repository contains ESP-IDF firmware for an **ESP32-S3 camera-based back-seat occupancy reminder prototype**. On first boot it opens a Wi-Fi setup portal. Afterwards it scans for the driver's BLE beacon, and only when the driver is away does it power up the back-seat sensors (camera + face detection, thermal camera, mmWave radar, temperature/humidity). The indicator LED reflects the combined face, mmWave and thermal presence signals.
 
 The project also provides an on-device captive-portal setup flow for collecting and persisting contact-related settings. A primary BOOT press/release can now request a test SMS through the secondary ESP32 in `cell/`. Real sending defaults off for bring-up. There are no automatic sensor-triggered SMS alerts, calls or emergency-services integrations.
 
@@ -13,16 +13,30 @@ The project also provides an on-device captive-portal setup flow for collecting 
 - Project name: `backseat-minder`
 - Build system: CMake / `idf.py`
 - Main source directory: `main/`
-- Application partition: 2 MB factory app (`partitions.csv`)
+- Application partition: 6 MB factory app (`partitions.csv`; the board has 8 MB flash).
+  Bluetooth + Wi-Fi + camera + face models are about 1.9 MB, which nearly filled the old 2 MB partition.
 
-The root `CMakeLists.txt` also points `EXTRA_COMPONENT_DIRS` at a local ESP-WHO checkout. This means builds expect ESP-WHO to be available at the configured path, in addition to the managed components recorded in `dependencies.lock`.
+ESP-WHO **release/v1.1.0** is a git submodule in `esp-who/` (the newer ESP-WHO master
+branch is a rewrite without `who_camera.h`/the `modules` component and does not work here).
+The root `CMakeLists.txt` adds `esp-who/components` to `EXTRA_COMPONENT_DIRS`, or the
+checkout named by the `ESP_WHO_PATH` environment variable, and stops with a clear message
+if it is missing. The IDF component manager downloads the rest (`dependencies.lock`).
 
-Typical device workflow from the source comments:
+`sdkconfig.defaults` holds every setting the project needs (target, flash/PSRAM, partition
+table, camera pins, BLE 4.2 scanning), so a deleted `sdkconfig` is rebuilt correctly.
+BLE 4.2 features must stay enabled: on the ESP32-S3 ESP-IDF defaults to BLE 5.0 only,
+which removes the `esp_ble_gap_set_scan_params`/`esp_ble_gap_start_scanning` scan API.
+
+Typical device workflow:
 
 ```text
+git submodule update --init --recursive esp-who
 idf.py build
 idf.py -p COM4 flash monitor
 ```
+
+If the flash still holds settings from an older build you want to discard, run
+`idf.py -p COM4 erase-flash` once before flashing; the device then boots into setup.
 
 `COM4` is an example local serial port, not a portable project setting.
 
@@ -30,7 +44,14 @@ idf.py -p COM4 flash monitor
 
 | File | Role |
 | --- | --- |
-| `main/app_main.cpp` | Firmware entry point; initializes setup support, camera/face detection, and the main LED loop. |
+| `main/app_main.cpp` | Firmware entry point; setup-first boot, beacon gate that starts/stops the sensors, LED and telemetry loop. |
+| `main/beacon_tracker.cpp` | BLE scan for the driver's beacon (fixed MAC); median RSSI with threshold + hysteresis and a 5 s lost-beacon timeout. |
+| `main/presence_sensors.cpp` | Starts/stops all back-seat sensors together; owns the thermal-camera task. |
+| `main/camera_sensor.cpp` | Camera init/deinit and one capture → face detection → USB preview task. |
+| `main/tuned_face_detection.cpp` | Two-stage ESP-WHO face detector on one frame. |
+| `main/usb_camera_stream.cpp` | Rate-limited JPEG preview frames over native USB. |
+| `main/thermal_camera.cpp`, `main/mmwave_sensor.cpp`, `main/temp_humidity_sensor.cpp` | MLX90640, C4001 and AM2302/DHT22 drivers, each with init/start and deinit/stop. |
+| `main/captive_dns.h`, `main/phone_number.h` | Host-tested helpers for the setup portal's DNS replies and phone validation. |
 | `main/boot_button.cpp` | Debounced BOOT press/release event; no sleep or driver-presence toggle. |
 | `main/cellular_link.cpp` | UART2 SMS worker, acknowledgement/result logging, busy guard and timeouts. |
 | `main/cellular_diagnostics.cpp` | Thread-safe last-eight-event history, sent over native USB as BSMC JSON snapshots. |
@@ -45,20 +66,43 @@ idf.py -p COM4 flash monitor
 
 ## Runtime Behavior
 
+### Boot: setup first
+
+1. `app_main()` calls `setup_mode_init()` (NVS + GPIO 38 button), holds GPIO 48 (onboard
+   WS2812/NeoPixel) low and configures GPIO 2 as the indicator LED.
+2. `setup_mode_requested_at_boot()` opens setup **before Bluetooth, the camera or any sensor
+   is created** when any of these is true:
+   - no usable name and primary phone number are saved (first boot, or after `erase-flash`);
+   - the GPIO 38 setup button is held during boot;
+   - setup was requested at runtime (see below).
+   Setup saves the form and restarts, so normal mode always starts from a clean boot.
+
 ### Normal mode
 
-1. `app_main()` calls `setup_mode_init()`.
-2. GPIO 48 is driven low to suppress unintended light from the ESP32-S3 onboard WS2812/NeoPixel.
-3. GPIO 2 is configured as the indicator LED output.
-4. A FreeRTOS queue is created for camera frames.
-5. The ESP-WHO camera pipeline is registered for RGB565/QVGA frames and face detection.
-6. The application polls with a 20 ms delay between iterations:
-   - checks BOOT press/release and queues the named alert to the saved primary number;
-   - checks whether GPIO 38 is being held, and enters setup mode if so;
-   - every three seconds, updates in-memory `temperature_f` and `humidity_percent`
-     values from an AM2302/DHT22 sensor on GPIO 1;
-   - reads `get_tuned_face_detected()` and the mmWave/thermal presence signals;
-   - sets GPIO 2 high when any of those signals indicates presence and low otherwise.
+1. BOOT button, cellular UART link and native USB telemetry are initialized.
+2. Bluetooth starts a continuous passive BLE scan for the driver's beacon
+   (`beacon_tracker.cpp`, MAC `78:9f:38:08:0b:e5`).
+3. **All presence sensors stay off while the driver is near.** Nothing is initialized:
+   no camera driver, no I2C bus for the thermal camera, no mmWave UART, no DHT22 RMT channel.
+4. The driver counts as **away** when the beacon has not been seen for 5 s, or its median
+   RSSI (last 6 readings) drops more than 5 dB below `RSSI_THRESHOLD` (currently -50 dBm for
+   bench testing; -70 to -80 is a more realistic "left the car" radius). It counts as **near**
+   again when the median is at or above the threshold. After boot the driver is assumed near
+   for 5 s while the scanner looks for the beacon. The decision must then hold for 3 s
+   before the main loop acts on it.
+5. Driver away → `presence_sensors_start()`: camera + face detection, MLX90640 thermal task,
+   C4001 mmWave (full configuration on the first start after boot, `sensorStart` afterwards)
+   and the DHT22.
+   Driver near again → `presence_sensors_stop()`: camera driver deinitialized, thermal I2C bus
+   released, mmWave `sensorStop` + UART released, DHT22 RMT channel released.
+6. The main loop runs every 20 ms:
+   - BOOT press/release sends the test SMS to the saved primary number;
+   - holding GPIO 38 restarts the device straight into setup (`setup_mode_restart_into_setup()`,
+     using a flag kept in RTC memory across the restart);
+   - while sensors are on, GPIO 2 is high when face, mmWave or thermal indicates presence;
+     it is low otherwise and always low while the driver is near;
+   - every three seconds it reads the DHT22 (only while sensors are on) and sends USB telemetry.
+     Telemetry also includes `driver_near`, `sensors_active` and `beacon_rssi`.
 
 These presence signals drive the LED and USB telemetry; they do not automatically trigger SMS.
 
@@ -137,15 +181,22 @@ The panel marks telemetry stale after ten seconds without a valid cellular packe
 
 ### Setup mode
 
-Holding the external setup button on GPIO 38 enters a blocking setup session:
+Setup opens automatically on boot when nothing usable is saved, when GPIO 38 is held at
+boot, or after GPIO 38 is held at runtime (the device restarts into setup). It always runs
+with Bluetooth and every sensor off:
 
 1. The device starts an **open** Wi-Fi access point:
    - SSID: `Backseat Minder`
    - Password: none
    - IP address/gateway: `192.168.4.1`
-2. A lightweight UDP DNS server answers DNS queries with `192.168.4.1`, creating captive-portal behavior.
+2. DHCP hands out `192.168.4.1` as the DNS server and as the captive-portal URI (DHCP option 114).
+   A lightweight UDP DNS server answers every A query with `192.168.4.1`, creating
+   captive-portal behavior. Replies drop any EDNS record from the query (the old in-place
+   reply was malformed for EDNS queries, which phones send).
 3. An HTTP server serves the setup page and redirects common Android, iOS/macOS, Windows, and Firefox connectivity-check URLs to the portal.
-4. The portal accepts settings, saves them to NVS, displays a confirmation page, then ends setup.
+4. The portal accepts settings, validates them (required name; required mobile number and
+   optional contacts must have 7-15 digits, optionally with a leading `+`; formatting is
+   stripped before saving), saves them to NVS, displays a confirmation page, then ends setup.
 5. The firmware tears down the Wi-Fi/AP resources and reboots.
 
 While waiting for portal confirmation, GPIO 2 blinks every 200 ms.
@@ -170,8 +221,11 @@ Older devices without a saved `name` must complete setup before sending an alert
 Saved form values are HTML-escaped
 when displayed, including names containing apostrophes, quotes or ampersands.
 
-The manual BOOT alert reads the saved name and sends:
+The manual BOOT test reads the saved name and sends:
+`Backseat Minder test for {name}. This checks delivery of passenger alerts. No action is needed.`
+Setup also checks that the name fits the future alert text
 `ALERT: {name}'s Backseat Minder device has detected an unattended passenger in their vehicle.`
+(`alert_message.h`), which is not sent automatically yet.
 
 The primary `phone` field is read for each manual SMS request through `setup_mode_get_phone_number()`. The helper strips common phone formatting and rejects missing or malformed values. Emergency contacts and the emergency-alert toggle remain stored only.
 
@@ -202,7 +256,7 @@ Key dependencies locked in `dependencies.lock` include:
 - `espressif/mdns`
 - ESP-IDF
 
-The camera and face-detection entry points (`register_camera`, `register_human_face_detection`, and `get_face_detected`) come from ESP-WHO-related components, not from code implemented in this repository.
+The face-detection models (`HumanFaceDetectMSR01`/`HumanFaceDetectMNP01`), `draw_detection_result` and the `CAMERA_PIN_*` configuration come from ESP-WHO release/v1.1.0; the camera driver itself is `espressif/esp32-camera`. ESP-WHO's `register_camera()` is not used because its capture task cannot be stopped.
 
 ## Security and Product Notes
 
@@ -218,11 +272,13 @@ The camera and face-detection entry points (`register_camera`, `register_human_f
 - Complete cellular bench verification and define any future automatic alert policy.
 - Define runtime handling for emergency contacts and alert settings; only the primary phone is currently used.
 - Add secure provisioning/access control and avoid logging personal data.
+- Set `RSSI_THRESHOLD` in `beacon_tracker.cpp` for the real car and beacon (currently -50 dBm for bench testing), and make the beacon MAC configurable in setup.
 - Validate camera/face-detection accuracy and recovery behavior under real vehicle lighting, motion, heat, and network conditions.
 - Extend the cellular host tests in `tests/` with hardware-in-the-loop verification.
 
 ## Guidance for Future LLM Work
 
+- Keep setup ahead of Bluetooth/sensor start-up in `app_main()`; runtime setup requests restart instead of opening Wi-Fi alongside BLE and the camera.
 - Prefer changing `main/app_main.cpp` for normal detection-loop behavior and `main/setup_mode.cpp` for provisioning/configuration behavior.
 - Keep ESP-IDF lifecycle constraints in mind: the setup code intentionally keeps `esp_netif` and the default event loop initialized across setup sessions, while tearing down only the Wi-Fi driver and AP netif.
 - `enter_setup_mode()` blocks until the form is submitted and then restarts the device. Treat it as a mode transition, not a non-blocking helper.

@@ -1,0 +1,4 @@
+[submodule "esp-who"]
+	path = esp-who
+	url = https://github.com/espressif/esp-who.git
+	branch = release/v1.1.0

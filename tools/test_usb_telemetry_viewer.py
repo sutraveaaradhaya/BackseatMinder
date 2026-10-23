@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock
 
 from usb_telemetry_viewer import detection_statuses, update_detection_labels, regression_line
-from usb_telemetry_viewer import cellular_view, update_cellular_panel
+from usb_telemetry_viewer import cellular_view, update_cellular_panel, driver_status_text
 
 
 class CellularStatusTests(unittest.TestCase):
@@ -119,6 +119,21 @@ class DetectionStatusTests(unittest.TestCase):
         update_detection_labels(labels, {"face_detected": False})
         labels["Human presence"].configure.assert_called_with(
             text="✗", fg="red")
+
+
+class DriverStatusTests(unittest.TestCase):
+    def test_driver_near_with_sensors_off(self):
+        self.assertEqual(
+            driver_status_text({"driver_near": True, "sensors_active": False, "beacon_rssi": -45}),
+            "Driver: near (beacon -45 dBm) - sensors off")
+
+    def test_driver_away_beacon_lost(self):
+        self.assertEqual(
+            driver_status_text({"driver_near": False, "sensors_active": True, "beacon_rssi": 0}),
+            "Driver: away (beacon not seen) - sensors on")
+
+    def test_older_firmware(self):
+        self.assertIn("unknown", driver_status_text({"face_detected": True}))
 
 
 if __name__ == "__main__":
